@@ -1,12 +1,78 @@
-import React, { useEffect, useRef, useState, forwardRef, useImperativeHandle } from 'react';
+import React, { useEffect, useRef, useState, forwardRef, useImperativeHandle, useCallback } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
 import assets from './assets/assets.json';
 
 const FLOOR_TOP = 2;
+const DEFAULT_SCALE = 25;
 
-const ThreeDView = forwardRef(function ThreeDView({ rooms }, ref) {
+// ─── Resolve model path from model name ──────────────────────────────────────
+function resolveModelPath(typeName) {
+  const exact = assets.models.find((m) => m?.name?.toLowerCase() === typeName?.toLowerCase());
+  if (exact) return exact.path.replace('@assets', '/src/assets');
+
+  // Fuzzy match by longest common substring
+  let bestMatch = null, bestScore = 0;
+  const target = typeName?.toLowerCase() || '';
+  for (const m of assets.models) {
+    const mn = m?.name?.toLowerCase() || '';
+    let score = 0;
+    for (let i = 0; i < target.length; i++)
+      for (let j = i + 1; j <= target.length; j++) {
+        const s = target.substring(i, j);
+        if (s.length > 2 && mn.includes(s)) score = Math.max(score, s.length);
+      }
+    if (score > bestScore) { bestScore = score; bestMatch = m; }
+  }
+  return (bestMatch || assets.models[0]).path.replace('@assets', '/src/assets');
+}
+
+// ─── Load a GLTF model and place it at world position ─────────────────────────
+function placeModel({ scene, modelPath, worldX, worldZ, placedBBoxes, metadata, onDone }) {
+  const loader = new GLTFLoader();
+  loader.load(modelPath, (gltf) => {
+    const model = gltf.scene;
+    model.scale.multiplyScalar(DEFAULT_SCALE);
+    model.position.set(worldX, 0, worldZ);
+    scene.add(model);
+
+    const bbox = new THREE.Box3().setFromObject(model);
+    const size = bbox.getSize(new THREE.Vector3());
+    const yPos = FLOOR_TOP - bbox.min.y;
+    model.position.set(worldX, yPos, worldZ);
+
+    // Collision avoidance spiral
+    const testAt = (tx, tz) => {
+      model.position.set(tx, yPos, tz);
+      const b = new THREE.Box3().setFromObject(model);
+      return placedBBoxes.some((o) => b.intersectsBox(o.bbox));
+    };
+
+    let px = worldX, pz = worldZ;
+    if (testAt(px, pz)) {
+      const step = Math.max(size.x, size.z, 10);
+      let found = false;
+      for (let r = step; r <= 500 && !found; r += step)
+        for (let ang = 0; ang < 360; ang += 30) {
+          const rad = ang * Math.PI / 180;
+          const nx = px + Math.cos(rad) * r, nz = pz + Math.sin(rad) * r;
+          if (!testAt(nx, nz)) { px = nx; pz = nz; found = true; break; }
+        }
+    }
+    model.position.set(px, yPos, pz);
+
+    const finalBBox = new THREE.Box3().setFromObject(model);
+    placedBBoxes.push({ model, bbox: finalBBox });
+    model.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+    model.userData = { ...metadata, isInteractive: true, baseScale: DEFAULT_SCALE };
+
+    onDone?.(model);
+  }, undefined, (err) => console.error('Model load error:', err));
+}
+
+// ─── Main component ───────────────────────────────────────────────────────────
+const ThreeDView = forwardRef(function ThreeDView({ rooms, onRoomsChange }, ref) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
   const cameraRef = useRef(null);
@@ -15,111 +81,175 @@ const ThreeDView = forwardRef(function ThreeDView({ rooms }, ref) {
   const raycasterRef = useRef(new THREE.Raycaster());
   const mouseRef = useRef(new THREE.Vector2());
 
-  // Furniture interaction
   const furnitureObjectsRef = useRef([]);
   const placedBBoxesRef = useRef([]);
   const roomPositionsRef = useRef([]);
   const wallsRef = useRef([]);
+
   const isDraggingRef = useRef(false);
   const isRotatingRef = useRef(false);
   const dragSelectedRef = useRef(null);
   const dragOffsetRef = useRef(new THREE.Vector3());
   const lastMouseXRef = useRef(0);
 
-  const [selectedFurniture, setSelectedFurniture] = useState(null);
+  const [selectedFurniture, setSelectedFurniture] = useState(null);   // { userData, model }
   const [hoveredFurniture, setHoveredFurniture] = useState(null);
   const [dropHighlight, setDropHighlight] = useState(false);
-  const [isAdding, setIsAdding] = useState(false);
-  const [addingName, setAddingName] = useState('');
+  const [busyLabel, setBusyLabel] = useState('');
+  const [selectedScale, setSelectedScale] = useState(1.0);
 
-  // ── Exposed API for parent (drop-to-add) ──────────────────────────────────
+  // ── Scale slider handler ─────────────────────────────────────────────────
+  const handleScaleChange = useCallback((newScale) => {
+    setSelectedScale(newScale);
+    if (!selectedFurniture?.model) return;
+    const model = selectedFurniture.model;
+    const base = model.userData.baseScale || DEFAULT_SCALE;
+    model.scale.set(base * newScale, base * newScale, base * newScale);
+    model.userData.currentScale = newScale;
+    // Update placedBBoxes
+    const entry = placedBBoxesRef.current.find((e) => e.model === model);
+    if (entry) entry.bbox.setFromObject(model);
+  }, [selectedFurniture]);
+
+  // ── Exposed imperative API ────────────────────────────────────────────────
   useImperativeHandle(ref, () => ({
+
+    // Add furniture to a specific room by room index (AI-triggered)
+    addFurnitureToRoom(modelName, roomIndex = 0) {
+      const scene = sceneRef.current;
+      const rp = roomPositionsRef.current[roomIndex];
+      if (!scene || !rp) { console.warn('Scene or room not ready'); return; }
+      const modelPath = resolveModelPath(modelName);
+      const ri = Math.min(roomIndex, (rooms?.length || 1) - 1);
+
+      setBusyLabel(`Adding ${modelName.replace(/_/g, ' ')}…`);
+      placeModel({
+        scene, modelPath,
+        worldX: rp.x, worldZ: rp.z,
+        placedBBoxes: placedBBoxesRef.current,
+        metadata: {
+          type: modelName,
+          roomIndex: ri,
+          itemIndex: furnitureObjectsRef.current.length,
+          roomType: rooms?.[ri]?.roomtype || 'custom',
+          originalPosition: new THREE.Vector3(rp.x, FLOOR_TOP, rp.z),
+        },
+        onDone: (model) => {
+          furnitureObjectsRef.current.push(model);
+          setBusyLabel('');
+        },
+      });
+    },
+
+    // Drop furniture at specific screen coordinates (palette drag-and-drop)
     addFurnitureAtDrop(clientX, clientY, modelName) {
       const scene = sceneRef.current;
       const camera = cameraRef.current;
       const mount = mountRef.current;
-      const rooms_ = roomPositionsRef.current; // snapshot
+      const rps = roomPositionsRef.current;
       if (!scene || !camera || !mount) return;
 
-      const modelData = assets.models.find((m) => m.name === modelName);
-      if (!modelData) { console.warn('Model not found:', modelName); return; }
-      const modelPath = modelData.path.replace('@assets', '/src/assets');
-
-      // Screen → NDC → ray → floor plane
+      const modelPath = resolveModelPath(modelName);
       const rect = mount.getBoundingClientRect();
-      const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
-      const ndcY = -((clientY - rect.top) / rect.height) * 2 + 1;
-      const ray = new THREE.Raycaster();
-      ray.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
+      const raycaster = new THREE.Raycaster();
+      raycaster.setFromCamera(
+        new THREE.Vector2(
+          ((clientX - rect.left) / rect.width) * 2 - 1,
+          -((clientY - rect.top) / rect.height) * 2 + 1
+        ),
+        camera
+      );
       const floorPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -FLOOR_TOP);
       const hitPoint = new THREE.Vector3();
-      ray.ray.intersectPlane(floorPlane, hitPoint);
+      raycaster.ray.intersectPlane(floorPlane, hitPoint);
+      if (!hitPoint.length()) hitPoint.set(rps[0]?.x || 0, FLOOR_TOP, rps[0]?.z || 0);
 
-      // Fallback to first room centre
-      if (!hitPoint.length()) {
-        const rp = roomPositionsRef.current;
-        hitPoint.set(rp.length ? rp[0].x : 0, FLOOR_TOP, rp.length ? rp[0].z : 0);
-      }
-
-      // Which room?
+      // Determine which room
       let roomIndex = 0;
-      for (let i = 0; i < roomPositionsRef.current.length; i++) {
-        const rp = roomPositionsRef.current[i];
-        const r = rooms[i];
-        if (!r) continue;
+      for (let i = 0; i < rps.length; i++) {
+        const r = rooms?.[i]; if (!r) continue;
         const hw = r.dimensions.breadth / 2, hd = r.dimensions.length / 2;
-        if (hitPoint.x >= rp.x - hw && hitPoint.x <= rp.x + hw &&
-            hitPoint.z >= rp.z - hd && hitPoint.z <= rp.z + hd) { roomIndex = i; break; }
+        if (hitPoint.x >= rps[i].x - hw && hitPoint.x <= rps[i].x + hw &&
+          hitPoint.z >= rps[i].z - hd && hitPoint.z <= rps[i].z + hd) { roomIndex = i; break; }
       }
 
-      setIsAdding(true);
-      setAddingName(modelName.replace(/_/g, ' '));
-
-      const loader = new GLTFLoader();
-      loader.load(modelPath, (gltf) => {
-        const model = gltf.scene;
-        model.scale.multiplyScalar(25);
-        model.position.set(hitPoint.x, 0, hitPoint.z);
-        scene.add(model);
-
-        const bbox = new THREE.Box3().setFromObject(model);
-        const size = bbox.getSize(new THREE.Vector3());
-        const yPos = FLOOR_TOP - bbox.min.y;
-        model.position.set(hitPoint.x, yPos, hitPoint.z);
-
-        // Collision avoidance
-        const testAt = (tx, tz) => {
-          model.position.set(tx, yPos, tz);
-          const b = new THREE.Box3().setFromObject(model);
-          return placedBBoxesRef.current.some((o) => b.intersectsBox(o.bbox));
-        };
-
-        let px = hitPoint.x, pz = hitPoint.z;
-        if (testAt(px, pz)) {
-          const step = Math.max(size.x, size.z, 10);
-          let found = false;
-          for (let r = step; r <= 400 && !found; r += step)
-            for (let ang = 0; ang < 360; ang += 30) {
-              const rad = (ang * Math.PI) / 180;
-              const nx = px + Math.cos(rad) * r, nz = pz + Math.sin(rad) * r;
-              if (!testAt(nx, nz)) { px = nx; pz = nz; found = true; break; }
-            }
-        }
-        model.position.set(px, yPos, pz);
-
-        placedBBoxesRef.current.push({ model, bbox: new THREE.Box3().setFromObject(model) });
-        model.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
-        model.userData = {
+      setBusyLabel(`Placing ${modelName.replace(/_/g, ' ')}…`);
+      placeModel({
+        scene, modelPath,
+        worldX: hitPoint.x, worldZ: hitPoint.z,
+        placedBBoxes: placedBBoxesRef.current,
+        metadata: {
           type: modelName, roomIndex,
           itemIndex: furnitureObjectsRef.current.length,
-          roomType: rooms[roomIndex]?.roomtype || 'custom',
-          originalPosition: model.position.clone(),
-          isInteractive: true,
-        };
-        furnitureObjectsRef.current.push(model);
-        setIsAdding(false);
-        setAddingName('');
-      }, undefined, (err) => { console.error(err); setIsAdding(false); setAddingName(''); });
+          roomType: rooms?.[roomIndex]?.roomtype || 'custom',
+        },
+        onDone: (model) => { furnitureObjectsRef.current.push(model); setBusyLabel(''); },
+      });
+    },
+
+    // Remove all furniture matching a type name (case-insensitive)
+    removeFurnitureByType(typeName) {
+      const scene = sceneRef.current;
+      if (!scene) return;
+      const toRemove = furnitureObjectsRef.current.filter(
+        (m) => m.userData.type?.toLowerCase() === typeName?.toLowerCase()
+      );
+      toRemove.forEach((model) => {
+        scene.remove(model);
+        const idx = furnitureObjectsRef.current.indexOf(model);
+        if (idx >= 0) furnitureObjectsRef.current.splice(idx, 1);
+        const bIdx = placedBBoxesRef.current.findIndex((e) => e.model === model);
+        if (bIdx >= 0) placedBBoxesRef.current.splice(bIdx, 1);
+      });
+      if (selectedFurniture && toRemove.includes(selectedFurniture.model)) {
+        setSelectedFurniture(null);
+      }
+    },
+
+    // Scale all furniture matching a type
+    scaleFurnitureByType(typeName, scale) {
+      const clamped = Math.max(0.1, Math.min(3.0, scale));
+      furnitureObjectsRef.current
+        .filter((m) => m.userData.type?.toLowerCase() === typeName?.toLowerCase())
+        .forEach((model) => {
+          const base = model.userData.baseScale || DEFAULT_SCALE;
+          model.scale.set(base * clamped, base * clamped, base * clamped);
+          model.userData.currentScale = clamped;
+          const entry = placedBBoxesRef.current.find((e) => e.model === model);
+          if (entry) entry.bbox.setFromObject(model);
+        });
+      // Sync slider if this type is selected
+      if (selectedFurniture?.userData?.type?.toLowerCase() === typeName?.toLowerCase()) {
+        setSelectedScale(clamped);
+      }
+    },
+
+    // Clear all furniture from a specific room
+    clearRoom(roomIndex) {
+      const scene = sceneRef.current;
+      if (!scene) return;
+      const toRemove = furnitureObjectsRef.current.filter(
+        (m) => m.userData.roomIndex === roomIndex
+      );
+      toRemove.forEach((model) => {
+        scene.remove(model);
+        const idx = furnitureObjectsRef.current.indexOf(model);
+        if (idx >= 0) furnitureObjectsRef.current.splice(idx, 1);
+        const bIdx = placedBBoxesRef.current.findIndex((e) => e.model === model);
+        if (bIdx >= 0) placedBBoxesRef.current.splice(bIdx, 1);
+      });
+      if (selectedFurniture && toRemove.includes(selectedFurniture.model)) setSelectedFurniture(null);
+    },
+
+    // Return current furniture list for AI context
+    getFurnitureList() {
+      return furnitureObjectsRef.current.map((m, i) => ({
+        index: i,
+        type: m.userData.type || 'unknown',
+        roomIndex: m.userData.roomIndex ?? 0,
+        roomType: m.userData.roomType || '',
+        scale: m.userData.currentScale || 1.0,
+      }));
     },
   }));
 
@@ -195,26 +325,23 @@ const ThreeDView = forwardRef(function ThreeDView({ rooms }, ref) {
       side: THREE.DoubleSide, polygonOffset: true,
       polygonOffsetFactor: 1, polygonOffsetUnits: 1,
     });
-    const floorPalette = [0xe4e8f0, 0xeaedf5];
 
     rooms.forEach((room, ri) => {
       const rw = room.dimensions.breadth, rd = room.dimensions.length;
       const wallH = 80, wallT = 5;
       const cx = roomPositions[ri].x, cz = roomPositions[ri].z;
 
-      // Floor
       const floor = new THREE.Mesh(
         new THREE.BoxGeometry(rw, 2, rd),
-        new THREE.MeshStandardMaterial({ color: floorPalette[ri % 2], roughness: 0.9 })
+        new THREE.MeshStandardMaterial({ color: ri % 2 === 0 ? 0xe4e8f0 : 0xeaedf5, roughness: 0.9 })
       );
       floor.position.set(cx, 1, cz);
       floor.receiveShadow = true;
       scene.add(floor);
 
-      // Subtle grid
       const grid = new THREE.GridHelper(Math.max(rw, rd), Math.floor(Math.max(rw, rd) / 10), 0xc0c8d4, 0xc0c8d4);
       grid.position.set(cx, 2.1, cz);
-      grid.material.transparent = true; grid.material.opacity = 0.2;
+      grid.material.transparent = true; grid.material.opacity = 0.18;
       scene.add(grid);
 
       const addWall = (geo, pos, normal) => {
@@ -223,67 +350,31 @@ const ThreeDView = forwardRef(function ThreeDView({ rooms }, ref) {
         w.userData.normal = normal; w.userData.wallType = 'vertical';
         walls.push(w); scene.add(w);
       };
-      addWall(new THREE.BoxGeometry(rw, wallH, wallT), [cx, wallH/2, cz - rd/2], new THREE.Vector3(0,0,-1));
-      addWall(new THREE.BoxGeometry(rw, wallH, wallT), [cx, wallH/2, cz + rd/2], new THREE.Vector3(0,0,1));
-      addWall(new THREE.BoxGeometry(wallT, wallH, rd), [cx + rw/2, wallH/2, cz], new THREE.Vector3(1,0,0));
-      if (ri === 0) addWall(new THREE.BoxGeometry(wallT, wallH, rd), [cx - rw/2, wallH/2, cz], new THREE.Vector3(-1,0,0));
+      addWall(new THREE.BoxGeometry(rw, wallH, wallT), [cx, wallH / 2, cz - rd / 2], new THREE.Vector3(0, 0, -1));
+      addWall(new THREE.BoxGeometry(rw, wallH, wallT), [cx, wallH / 2, cz + rd / 2], new THREE.Vector3(0, 0, 1));
+      addWall(new THREE.BoxGeometry(wallT, wallH, rd), [cx + rw / 2, wallH / 2, cz], new THREE.Vector3(1, 0, 0));
+      if (ri === 0) addWall(new THREE.BoxGeometry(wallT, wallH, rd), [cx - rw / 2, wallH / 2, cz], new THREE.Vector3(-1, 0, 0));
 
-      // Initial furniture
-      const loader = new GLTFLoader();
-      room.furniture.forEach((item, ii) => {
-        const md = assets.models.find((m) => m?.name?.toLowerCase() === item?.type?.toLowerCase());
-        let mp = md ? md.path : null;
-        if (!mp) {
-          const it = item?.type?.toLowerCase() || '';
-          let best = null, bs = 0;
-          for (const m of assets.models) {
-            const mn = m?.name?.toLowerCase() || ''; let sc = 0;
-            for (let i = 0; i < it.length; i++) for (let j = i+1; j <= it.length; j++) {
-              const s = it.substring(i, j);
-              if (s.length > 2 && mn.includes(s)) sc = Math.max(sc, s.length);
-            }
-            if (sc > bs) { bs = sc; best = m; }
-          }
-          mp = (best || assets.models[0]).path;
-        }
-        mp = mp.replace('@assets', '/src/assets');
+      // Initial furniture from AI/upload
+      room.furniture?.forEach((item, ii) => {
+        const mp = resolveModelPath(item.type);
+        const hw = rw / 2, hd = rd / 2, m2 = 2, wt = 5;
 
-        loader.load(mp, (gltf) => {
-          const model = gltf.scene;
-          model.scale.multiplyScalar(25);
-          const bbox = new THREE.Box3().setFromObject(model);
-          const size = bbox.getSize(new THREE.Vector3());
-          const hw = rw/2, hd = rd/2, m2 = 2;
-          const maxX = hw - wallT - size.x/2 - m2, minX = -hw + wallT + size.x/2 + m2;
-          const maxZ = hd - wallT - size.z/2 - m2, minZ = -hd + wallT + size.z/2 + m2;
-          let px = item.position[0], pz = item.position[1];
-          if (minX <= maxX) px = Math.min(Math.max(px, minX), maxX); else px = 0;
-          if (minZ <= maxZ) pz = Math.min(Math.max(pz, minZ), maxZ); else pz = 0;
-          const yPos = FLOOR_TOP - bbox.min.y;
-
-          const testAt = (tx, tz) => { model.position.set(tx+cx, yPos, tz+cz); const b = new THREE.Box3().setFromObject(model); return placedBBoxes.some((o) => b.intersectsBox(o.bbox)); };
-          if (testAt(px, pz)) {
-            const step = Math.max(size.x, size.z, 5); let found = false;
-            for (let r = step; r <= Math.max(rw, rd) && !found; r += step)
-              for (let ang = 0; ang < 360; ang += 30) {
-                const rad = ang * Math.PI / 180;
-                const nx = px + Math.cos(rad) * r, nz = pz + Math.sin(rad) * r;
-                if (nx < minX || nx > maxX || nz < minZ || nz > maxZ) continue;
-                if (!testAt(nx, nz)) { px = nx; pz = nz; found = true; break; }
-              }
-            if (!found) { px = 0; pz = 0; }
-          }
-          model.position.set(px+cx, yPos, pz+cz);
-          placedBBoxes.push({ model, bbox: new THREE.Box3().setFromObject(model) });
-          model.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
-          model.userData = { type: item.type, roomIndex: ri, itemIndex: ii, roomType: room.roomtype, originalPosition: model.position.clone(), isInteractive: true };
-          furnitureObjects.push(model);
-          scene.add(model);
-        }, undefined, (e) => console.error(e));
+        placeModel({
+          scene, modelPath: mp,
+          worldX: item.position[0] + cx - rw / 2,
+          worldZ: item.position[1] + cz - rd / 2,
+          placedBBoxes,
+          metadata: {
+            type: item.type, roomIndex: ri, itemIndex: ii,
+            roomType: room.roomtype,
+          },
+          onDone: (model) => furnitureObjects.push(model),
+        });
       });
     });
 
-    // Wall visibility
+    // Wall visibility update
     const updateWalls = () => {
       walls.forEach((w) => {
         if (w.userData.wallType !== 'vertical') return;
@@ -293,19 +384,15 @@ const ThreeDView = forwardRef(function ThreeDView({ rooms }, ref) {
       });
     };
 
-    // ── Interaction handlers ────────────────────────────────────────────────
-    const getCanvasNDC = (e) => {
+    // ── Input handlers ──────────────────────────────────────────────────────
+    const ndcOf = (e) => {
       const rect = renderer.domElement.getBoundingClientRect();
       return {
         x: ((e.clientX - rect.left) / rect.width) * 2 - 1,
         y: -((e.clientY - rect.top) / rect.height) * 2 + 1,
       };
     };
-
-    const findInteractiveParent = (obj) => {
-      while (obj && !obj.userData.isInteractive) obj = obj.parent;
-      return obj;
-    };
+    const findRoot = (obj) => { while (obj && !obj.userData.isInteractive) obj = obj.parent; return obj; };
 
     const onMouseMove = (e) => {
       if (isRotatingRef.current && dragSelectedRef.current) {
@@ -314,12 +401,12 @@ const ThreeDView = forwardRef(function ThreeDView({ rooms }, ref) {
         renderer.domElement.style.cursor = 'crosshair';
         return;
       }
-      const { x, y } = getCanvasNDC(e);
+      const { x, y } = ndcOf(e);
       mouseRef.current.set(x, y);
 
       if (isDraggingRef.current && dragSelectedRef.current) {
         raycasterRef.current.setFromCamera(mouseRef.current, camera);
-        const plane = new THREE.Plane(new THREE.Vector3(0,1,0), -FLOOR_TOP);
+        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -FLOOR_TOP);
         const hit = new THREE.Vector3();
         if (raycasterRef.current.ray.intersectPlane(plane, hit)) {
           const model = dragSelectedRef.current;
@@ -330,9 +417,9 @@ const ThreeDView = forwardRef(function ThreeDView({ rooms }, ref) {
           const rw = rv.dimensions.breadth, rd = rv.dimensions.length;
           const bb = new THREE.Box3().setFromObject(model);
           const sz = bb.getSize(new THREE.Vector3());
-          const m2 = 2, wt = 5;
-          const maxX = rw/2 - wt - sz.x/2 - m2, minX = -rw/2 + wt + sz.x/2 + m2;
-          const maxZ = rd/2 - wt - sz.z/2 - m2, minZ = -rd/2 + wt + sz.z/2 + m2;
+          const wt = 5, m2 = 2;
+          const maxX = rw / 2 - wt - sz.x / 2 - m2, minX = -rw / 2 + wt + sz.x / 2 + m2;
+          const maxZ = rd / 2 - wt - sz.z / 2 - m2, minZ = -rd / 2 + wt + sz.z / 2 + m2;
           let rx = desired.x - rp.x, rz = desired.z - rp.z;
           if (minX <= maxX) rx = Math.min(Math.max(rx, minX), maxX); else rx = 0;
           if (minZ <= maxZ) rz = Math.min(Math.max(rz, minZ), maxZ); else rz = 0;
@@ -349,7 +436,7 @@ const ThreeDView = forwardRef(function ThreeDView({ rooms }, ref) {
       raycasterRef.current.setFromCamera(mouseRef.current, camera);
       const hits = raycasterRef.current.intersectObjects(furnitureObjects, true);
       if (hits.length) {
-        const obj = findInteractiveParent(hits[0].object);
+        const obj = findRoot(hits[0].object);
         if (obj?.userData.isInteractive) { setHoveredFurniture(obj.userData); renderer.domElement.style.cursor = 'grab'; return; }
       }
       setHoveredFurniture(null); renderer.domElement.style.cursor = 'default';
@@ -357,19 +444,20 @@ const ThreeDView = forwardRef(function ThreeDView({ rooms }, ref) {
 
     const onPointerDown = (e) => {
       if (isRotatingRef.current) return;
-      const { x, y } = getCanvasNDC(e);
-      mouseRef.current.set(x, y);
+      const { x, y } = ndcOf(e); mouseRef.current.set(x, y);
       raycasterRef.current.setFromCamera(mouseRef.current, camera);
       const hits = raycasterRef.current.intersectObjects(furnitureObjects, true);
       if (hits.length) {
-        const obj = findInteractiveParent(hits[0].object);
+        const obj = findRoot(hits[0].object);
         if (obj?.userData.isInteractive) {
-          dragSelectedRef.current = obj; setSelectedFurniture(obj.userData);
+          dragSelectedRef.current = obj;
+          setSelectedFurniture({ userData: obj.userData, model: obj });
+          setSelectedScale(obj.userData.currentScale || 1.0);
           isDraggingRef.current = true;
-          const plane = new THREE.Plane(new THREE.Vector3(0,1,0), -FLOOR_TOP);
+          const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -FLOOR_TOP);
           const hit = new THREE.Vector3();
           if (raycasterRef.current.ray.intersectPlane(plane, hit)) dragOffsetRef.current.copy(hit).sub(obj.position);
-          else dragOffsetRef.current.set(0,0,0);
+          else dragOffsetRef.current.set(0, 0, 0);
           const idx = placedBBoxes.findIndex((e2) => e2.model === obj);
           if (idx >= 0) placedBBoxes.splice(idx, 1);
           controls.enabled = false;
@@ -384,20 +472,27 @@ const ThreeDView = forwardRef(function ThreeDView({ rooms }, ref) {
     };
 
     const onDblClick = (e) => {
-      const { x, y } = getCanvasNDC(e); mouseRef.current.set(x, y);
+      const { x, y } = ndcOf(e); mouseRef.current.set(x, y);
       raycasterRef.current.setFromCamera(mouseRef.current, camera);
       const hits = raycasterRef.current.intersectObjects(furnitureObjects, true);
       if (hits.length) {
-        const obj = findInteractiveParent(hits[0].object);
+        const obj = findRoot(hits[0].object);
         if (obj?.userData.isInteractive) { dragSelectedRef.current = obj; isRotatingRef.current = true; lastMouseXRef.current = e.clientX; controls.enabled = false; }
       }
     };
 
     const onClick = (e) => {
-      const { x, y } = getCanvasNDC(e); mouseRef.current.set(x, y);
+      const { x, y } = ndcOf(e); mouseRef.current.set(x, y);
       raycasterRef.current.setFromCamera(mouseRef.current, camera);
       const hits = raycasterRef.current.intersectObjects(furnitureObjects, true);
-      if (hits.length) { const obj = findInteractiveParent(hits[0].object); if (obj?.userData.isInteractive) { setSelectedFurniture(obj.userData); return; } }
+      if (hits.length) {
+        const obj = findRoot(hits[0].object);
+        if (obj?.userData.isInteractive) {
+          setSelectedFurniture({ userData: obj.userData, model: obj });
+          setSelectedScale(obj.userData.currentScale || 1.0);
+          return;
+        }
+      }
       setSelectedFurniture(null);
     };
 
@@ -420,117 +515,115 @@ const ThreeDView = forwardRef(function ThreeDView({ rooms }, ref) {
     return () => {
       cancelAnimationFrame(animId);
       window.removeEventListener('resize', onResize);
-      renderer.domElement.removeEventListener('mousemove', onMouseMove);
-      renderer.domElement.removeEventListener('pointerdown', onPointerDown);
-      renderer.domElement.removeEventListener('pointerup', onPointerUp);
-      renderer.domElement.removeEventListener('dblclick', onDblClick);
-      renderer.domElement.removeEventListener('click', onClick);
+      ['mousemove', 'pointerdown', 'pointerup', 'dblclick', 'click'].forEach((ev) =>
+        renderer.domElement.removeEventListener(ev, { mousemove: onMouseMove, pointerdown: onPointerDown, pointerup: onPointerUp, dblclick: onDblClick, click: onClick }[ev])
+      );
       if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
       renderer.dispose();
     };
   }, [rooms]);
 
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <div
       style={{ position: 'relative', width: '100%', height: '100%' }}
       onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; setDropHighlight(true); }}
       onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDropHighlight(false); }}
       onDrop={(e) => {
-        e.preventDefault();
-        setDropHighlight(false);
+        e.preventDefault(); setDropHighlight(false);
         const modelName = e.dataTransfer.getData('text/plain');
         if (modelName && ref?.current) ref.current.addFurnitureAtDrop(e.clientX, e.clientY, modelName);
       }}
     >
       <div ref={mountRef} style={{ width: '100%', height: '100%' }} />
 
-      {/* Drop highlight overlay */}
+      {/* Drop overlay */}
       {dropHighlight && (
-        <div style={{
-          position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 20,
-          border: '3px dashed #6366f1', borderRadius: 8,
-          background: 'rgba(99,102,241,0.06)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-        }}>
-          <div style={{
-            background: 'rgba(99,102,241,0.95)', color: 'white',
-            padding: '12px 32px', borderRadius: 16, fontSize: 15, fontWeight: 700,
-            boxShadow: '0 8px 32px rgba(99,102,241,0.35)',
-          }}>
+        <div style={{ position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 20, border: '3px dashed #6366f1', borderRadius: 8, background: 'rgba(99,102,241,0.05)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+          <div style={{ background: 'rgba(99,102,241,0.95)', color: '#fff', padding: '12px 30px', borderRadius: 14, fontSize: 14, fontWeight: 700, boxShadow: '0 8px 32px rgba(99,102,241,0.3)' }}>
             📦 Release to place furniture
           </div>
         </div>
       )}
 
-      {/* Adding indicator */}
-      {isAdding && (
-        <div style={{
-          position: 'absolute', top: 16, left: '50%', transform: 'translateX(-50%)',
-          background: 'rgba(17,24,39,0.88)', color: 'white',
-          padding: '8px 20px', borderRadius: 20, fontSize: 13, fontWeight: 600,
-          display: 'flex', alignItems: 'center', gap: 8, zIndex: 30,
-          backdropFilter: 'blur(10px)',
-        }}>
-          <svg style={{ animation: 'spin 0.8s linear infinite', width: 15, height: 15, flexShrink: 0 }} viewBox="0 0 24 24" fill="none">
-            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" />
+      {/* Busy overlay */}
+      {busyLabel && (
+        <div style={{ position: 'absolute', top: 14, left: '50%', transform: 'translateX(-50%)', background: 'rgba(17,24,39,0.88)', color: '#fff', padding: '8px 20px', borderRadius: 20, fontSize: 12, fontWeight: 600, display: 'flex', alignItems: 'center', gap: 8, zIndex: 30, backdropFilter: 'blur(10px)' }}>
+          <svg style={{ animation: 'th3spin 0.7s linear infinite', width: 14, height: 14, flexShrink: 0 }} viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.2" />
             <path fill="currentColor" opacity="0.8" d="M4 12a8 8 0 018-8v8H4z" />
           </svg>
-          Placing {addingName}…
+          {busyLabel}
         </div>
       )}
 
       {/* Hover tooltip */}
-      {hoveredFurniture && !isAdding && (
-        <div style={{
-          position: 'absolute', top: 16, left: 16, pointerEvents: 'none', zIndex: 20,
-          background: 'rgba(17,24,39,0.88)', color: 'white',
-          padding: '8px 14px', borderRadius: 10, fontSize: 13,
-          backdropFilter: 'blur(8px)', border: '1px solid rgba(255,255,255,0.08)',
-        }}>
-          <strong style={{ display: 'block', fontSize: 13 }}>{hoveredFurniture.type?.replace(/_/g, ' ')}</strong>
-          <span style={{ fontSize: 11, opacity: 0.65 }}>{hoveredFurniture.roomType}</span>
+      {hoveredFurniture && !busyLabel && (
+        <div style={{ position: 'absolute', top: 14, left: 14, pointerEvents: 'none', zIndex: 20, background: 'rgba(17,24,39,0.88)', color: '#fff', padding: '7px 13px', borderRadius: 9, fontSize: 12, backdropFilter: 'blur(8px)', border: '1px solid rgba(255,255,255,0.08)' }}>
+          <strong style={{ display: 'block', fontSize: 12 }}>{hoveredFurniture.type?.replace(/_/g, ' ')}</strong>
+          <span style={{ fontSize: 10, opacity: 0.65 }}>{hoveredFurniture.roomType}</span>
         </div>
       )}
 
-      {/* Selection panel */}
+      {/* ── Selection panel with scale slider ── */}
       {selectedFurniture && (
-        <div style={{
-          position: 'absolute', top: 16, right: 16, zIndex: 20,
-          background: 'white', padding: '14px 16px', borderRadius: 14,
-          boxShadow: '0 4px 24px rgba(0,0,0,0.11)', minWidth: 210,
-          border: '1px solid #e5e7eb',
-        }}>
-          <div style={{ fontSize: 10, color: '#9ca3af', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 8 }}>Selected Item</div>
-          <div style={{ fontSize: 15, fontWeight: 700, color: '#111', marginBottom: 3 }}>
-            {selectedFurniture.type?.replace(/_/g, ' ')}
+        <div style={{ position: 'absolute', top: 14, right: 14, zIndex: 20, background: '#fff', padding: '14px 16px', borderRadius: 14, boxShadow: '0 4px 28px rgba(0,0,0,0.13)', minWidth: 220, border: '1px solid #e5e7eb' }}>
+          <div style={{ fontSize: 10, color: '#9ca3af', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 7 }}>Selected Item</div>
+          <div style={{ fontSize: 15, fontWeight: 800, color: '#111', marginBottom: 2 }}>{selectedFurniture.userData.type?.replace(/_/g, ' ')}</div>
+          <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 14 }}>📍 {selectedFurniture.userData.roomType}</div>
+
+          {/* Scale slider */}
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
+              <label style={{ fontSize: 11, fontWeight: 700, color: '#374151' }}>Size</label>
+              <span style={{ fontSize: 11, fontWeight: 700, color: '#6366f1', background: '#eef2ff', padding: '2px 7px', borderRadius: 6 }}>
+                {selectedScale.toFixed(2)}×
+              </span>
+            </div>
+            <input
+              type="range"
+              min="0.1" max="3.0" step="0.05"
+              value={selectedScale}
+              onChange={(e) => handleScaleChange(parseFloat(e.target.value))}
+              style={{ width: '100%', accentColor: '#6366f1', cursor: 'pointer', height: 4 }}
+            />
+            <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 9.5, color: '#9ca3af', marginTop: 3 }}>
+              <span>Tiny (0.1×)</span><span>Normal (1×)</span><span>Large (3×)</span>
+            </div>
+            {/* Quick size buttons */}
+            <div style={{ display: 'flex', gap: 4, marginTop: 8 }}>
+              {[['XS', 0.25], ['S', 0.5], ['M', 1.0], ['L', 1.5], ['XL', 2.5]].map(([lbl, val]) => (
+                <button key={lbl} onClick={() => handleScaleChange(val)} style={{
+                  flex: 1, padding: '4px 2px', fontSize: 10, fontWeight: 700, borderRadius: 6, cursor: 'pointer', border: '1px solid',
+                  borderColor: Math.abs(selectedScale - val) < 0.05 ? '#6366f1' : '#e5e7eb',
+                  background: Math.abs(selectedScale - val) < 0.05 ? '#eef2ff' : '#f9fafb',
+                  color: Math.abs(selectedScale - val) < 0.05 ? '#6366f1' : '#6b7280',
+                }}>{lbl}</button>
+              ))}
+            </div>
           </div>
-          <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 12 }}>📍 {selectedFurniture.roomType}</div>
-          <div style={{ fontSize: 11, color: '#6b7280', lineHeight: 1.7, marginBottom: 12, padding: '8px 10px', background: '#f8fafc', borderRadius: 8, border: '1px solid #f1f5f9' }}>
-            🖱 <b>Drag</b> to reposition<br />
-            ↔ <b>Double-click</b> to rotate
+
+          <div style={{ fontSize: 10.5, color: '#9ca3af', lineHeight: 1.7, marginBottom: 12, padding: '7px 9px', background: '#f8fafc', borderRadius: 8, border: '1px solid #f1f5f9' }}>
+            🖱 <b>Drag</b> to move &nbsp;|&nbsp; ↔ <b>Dbl-click</b> to rotate
           </div>
           <button
             onClick={() => setSelectedFurniture(null)}
-            style={{ width: '100%', padding: '7px', fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb', background: '#f9fafb', color: '#374151', cursor: 'pointer', fontWeight: 600 }}
+            style={{ width: '100%', padding: '7px', fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb', background: '#f9fafb', color: '#374151', cursor: 'pointer', fontWeight: 700 }}
           >✕ Deselect</button>
         </div>
       )}
 
-      {/* Bottom hint bar */}
-      <div style={{
-        position: 'absolute', bottom: 14, left: '50%', transform: 'translateX(-50%)',
-        background: 'rgba(17,24,39,0.72)', color: 'rgba(255,255,255,0.82)',
-        padding: '5px 20px', borderRadius: 20, fontSize: 11, pointerEvents: 'none',
-        backdropFilter: 'blur(8px)', display: 'flex', gap: 20, whiteSpace: 'nowrap', zIndex: 15,
-      }}>
+      {/* Bottom hint */}
+      <div style={{ position: 'absolute', bottom: 12, left: '50%', transform: 'translateX(-50%)', background: 'rgba(17,24,39,0.70)', color: 'rgba(255,255,255,0.82)', padding: '5px 18px', borderRadius: 20, fontSize: 10.5, pointerEvents: 'none', backdropFilter: 'blur(8px)', display: 'flex', gap: 18, whiteSpace: 'nowrap', zIndex: 15 }}>
         <span>🌀 Orbit</span>
-        <span>🖱 Move furniture</span>
-        <span>↔ Dbl-click rotate</span>
-        <span>🔍 Scroll zoom</span>
+        <span>🖱 Move</span>
+        <span>↔ Dbl rotate</span>
+        <span>🔍 Zoom</span>
         <span>📦 Drag from palette</span>
+        <span>⬜ Click to resize</span>
       </div>
 
-      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      <style>{`@keyframes th3spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   );
 });
