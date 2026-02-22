@@ -1,0 +1,20 @@
+# Roomify backend requirements
+fastapi
+uvicorn[standard]
+python-multipart
+numpy
+opencv-python
+pillow
+torch
+torchvision
+transformers
+timm
+colorthief
+ultralytics
+midas
+segment-anything
+yolov5
+scikit-image
+matplotlib
+open3d
+replicate
