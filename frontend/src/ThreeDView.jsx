@@ -1,326 +1,376 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef, useState, forwardRef, useImperativeHandle } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader';
 import assets from './assets/assets.json';
 
-export default function ThreeDView({ rooms }) {
-  const isRotatingRef = useRef(false);
-  const lastMouseYRef = useRef(0);
+const FLOOR_TOP = 2;
+
+const ThreeDView = forwardRef(function ThreeDView({ rooms }, ref) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
+  const cameraRef = useRef(null);
+  const rendererRef = useRef(null);
+  const controlsRef = useRef(null);
   const raycasterRef = useRef(new THREE.Raycaster());
   const mouseRef = useRef(new THREE.Vector2());
+
+  // Furniture interaction
   const furnitureObjectsRef = useRef([]);
+  const placedBBoxesRef = useRef([]);
+  const roomPositionsRef = useRef([]);
   const wallsRef = useRef([]);
   const isDraggingRef = useRef(false);
+  const isRotatingRef = useRef(false);
   const dragSelectedRef = useRef(null);
   const dragOffsetRef = useRef(new THREE.Vector3());
-  const cameraRef = useRef(null);
+  const lastMouseXRef = useRef(0);
 
   const [selectedFurniture, setSelectedFurniture] = useState(null);
   const [hoveredFurniture, setHoveredFurniture] = useState(null);
+  const [dropHighlight, setDropHighlight] = useState(false);
+  const [isAdding, setIsAdding] = useState(false);
+  const [addingName, setAddingName] = useState('');
 
+  // ── Exposed API for parent (drop-to-add) ──────────────────────────────────
+  useImperativeHandle(ref, () => ({
+    addFurnitureAtDrop(clientX, clientY, modelName) {
+      const scene = sceneRef.current;
+      const camera = cameraRef.current;
+      const mount = mountRef.current;
+      const rooms_ = roomPositionsRef.current; // snapshot
+      if (!scene || !camera || !mount) return;
+
+      const modelData = assets.models.find((m) => m.name === modelName);
+      if (!modelData) { console.warn('Model not found:', modelName); return; }
+      const modelPath = modelData.path.replace('@assets', '/src/assets');
+
+      // Screen → NDC → ray → floor plane
+      const rect = mount.getBoundingClientRect();
+      const ndcX = ((clientX - rect.left) / rect.width) * 2 - 1;
+      const ndcY = -((clientY - rect.top) / rect.height) * 2 + 1;
+      const ray = new THREE.Raycaster();
+      ray.setFromCamera(new THREE.Vector2(ndcX, ndcY), camera);
+      const floorPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -FLOOR_TOP);
+      const hitPoint = new THREE.Vector3();
+      ray.ray.intersectPlane(floorPlane, hitPoint);
+
+      // Fallback to first room centre
+      if (!hitPoint.length()) {
+        const rp = roomPositionsRef.current;
+        hitPoint.set(rp.length ? rp[0].x : 0, FLOOR_TOP, rp.length ? rp[0].z : 0);
+      }
+
+      // Which room?
+      let roomIndex = 0;
+      for (let i = 0; i < roomPositionsRef.current.length; i++) {
+        const rp = roomPositionsRef.current[i];
+        const r = rooms[i];
+        if (!r) continue;
+        const hw = r.dimensions.breadth / 2, hd = r.dimensions.length / 2;
+        if (hitPoint.x >= rp.x - hw && hitPoint.x <= rp.x + hw &&
+            hitPoint.z >= rp.z - hd && hitPoint.z <= rp.z + hd) { roomIndex = i; break; }
+      }
+
+      setIsAdding(true);
+      setAddingName(modelName.replace(/_/g, ' '));
+
+      const loader = new GLTFLoader();
+      loader.load(modelPath, (gltf) => {
+        const model = gltf.scene;
+        model.scale.multiplyScalar(25);
+        model.position.set(hitPoint.x, 0, hitPoint.z);
+        scene.add(model);
+
+        const bbox = new THREE.Box3().setFromObject(model);
+        const size = bbox.getSize(new THREE.Vector3());
+        const yPos = FLOOR_TOP - bbox.min.y;
+        model.position.set(hitPoint.x, yPos, hitPoint.z);
+
+        // Collision avoidance
+        const testAt = (tx, tz) => {
+          model.position.set(tx, yPos, tz);
+          const b = new THREE.Box3().setFromObject(model);
+          return placedBBoxesRef.current.some((o) => b.intersectsBox(o.bbox));
+        };
+
+        let px = hitPoint.x, pz = hitPoint.z;
+        if (testAt(px, pz)) {
+          const step = Math.max(size.x, size.z, 10);
+          let found = false;
+          for (let r = step; r <= 400 && !found; r += step)
+            for (let ang = 0; ang < 360; ang += 30) {
+              const rad = (ang * Math.PI) / 180;
+              const nx = px + Math.cos(rad) * r, nz = pz + Math.sin(rad) * r;
+              if (!testAt(nx, nz)) { px = nx; pz = nz; found = true; break; }
+            }
+        }
+        model.position.set(px, yPos, pz);
+
+        placedBBoxesRef.current.push({ model, bbox: new THREE.Box3().setFromObject(model) });
+        model.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+        model.userData = {
+          type: modelName, roomIndex,
+          itemIndex: furnitureObjectsRef.current.length,
+          roomType: rooms[roomIndex]?.roomtype || 'custom',
+          originalPosition: model.position.clone(),
+          isInteractive: true,
+        };
+        furnitureObjectsRef.current.push(model);
+        setIsAdding(false);
+        setAddingName('');
+      }, undefined, (err) => { console.error(err); setIsAdding(false); setAddingName(''); });
+    },
+  }));
+
+  // ── Three.js scene setup ──────────────────────────────────────────────────
   useEffect(() => {
     if (!rooms || rooms.length === 0) return;
     const mount = mountRef.current;
-    const width = mount.clientWidth;
-    const height = mount.clientHeight;
+    const width = mount.clientWidth, height = mount.clientHeight;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xf5f5f5);
+    scene.background = new THREE.Color(0xeff1f5);
     sceneRef.current = scene;
 
-    const camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 5000);
+    const camera = new THREE.PerspectiveCamera(70, width / height, 0.1, 5000);
     cameraRef.current = camera;
 
-    let totalWidth = 0;
-    let maxDepth = 0;
+    let totalWidth = 0, maxDepth = 0;
     const roomPositions = [];
-    let currentX = 0;
-
+    let curX = 0;
     rooms.forEach((room) => {
-      const roomWidth = room.dimensions.breadth;
-      const roomDepth = room.dimensions.length;
-      roomPositions.push({ x: currentX + roomWidth / 2, z: roomDepth / 2 });
-      currentX += roomWidth;
-      totalWidth += roomWidth;
-      maxDepth = Math.max(maxDepth, roomDepth);
+      const rw = room.dimensions.breadth, rd = room.dimensions.length;
+      roomPositions.push({ x: curX + rw / 2, z: rd / 2 });
+      curX += rw; totalWidth += rw;
+      maxDepth = Math.max(maxDepth, rd);
     });
+    roomPositionsRef.current = roomPositions;
 
-    const centerX = totalWidth / 2;
-    const centerZ = maxDepth / 2;
-    const maxDimension = Math.max(totalWidth, maxDepth);
-    const cameraDistance = maxDimension * 1.2;
-    camera.position.set(centerX - cameraDistance * 0.7, cameraDistance * 0.6, centerZ + cameraDistance * 0.7);
-    camera.lookAt(centerX, 30, centerZ);
+    const cx0 = totalWidth / 2, cz0 = maxDepth / 2;
+    const maxDim = Math.max(totalWidth, maxDepth);
+    const cd = maxDim * 1.2;
+    camera.position.set(cx0 - cd * 0.7, cd * 0.6, cz0 + cd * 0.7);
+    camera.lookAt(cx0, 30, cz0);
 
     const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
-    renderer.setClearColor(0xf5f5f5, 1);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.setSize(width, height);
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     mount.appendChild(renderer.domElement);
+    rendererRef.current = renderer;
 
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
-    controls.dampingFactor = 0.05;
+    controls.enableDamping = true; controls.dampingFactor = 0.05;
     controls.screenSpacePanning = false;
-    controls.minDistance = 50;
-    controls.maxDistance = maxDimension * 3;
-    controls.target.set(centerX, 30, centerZ);
+    controls.minDistance = 50; controls.maxDistance = maxDim * 3;
+    controls.target.set(cx0, 30, cz0);
     controls.maxPolarAngle = Math.PI / 2.1;
+    controlsRef.current = controls;
 
-    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-
-    const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-    dirLight.position.set(centerX + 500, 500, centerZ + 500);
-    dirLight.castShadow = true;
-    dirLight.shadow.camera.left = -totalWidth;
-    dirLight.shadow.camera.right = totalWidth;
-    dirLight.shadow.camera.top = maxDepth;
-    dirLight.shadow.camera.bottom = -maxDepth;
-    dirLight.shadow.mapSize.width = 2048;
-    dirLight.shadow.mapSize.height = 2048;
-    scene.add(dirLight);
-
-    const fillLight = new THREE.DirectionalLight(0xffffff, 0.4);
-    fillLight.position.set(centerX - 300, 300, centerZ - 300);
-    scene.add(fillLight);
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x888888, 0.5));
+    // Lighting
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+    dir.position.set(cx0 + 500, 600, cz0 + 500);
+    dir.castShadow = true;
+    dir.shadow.camera.left = -totalWidth; dir.shadow.camera.right = totalWidth;
+    dir.shadow.camera.top = maxDepth; dir.shadow.camera.bottom = -maxDepth;
+    dir.shadow.mapSize.width = dir.shadow.mapSize.height = 2048;
+    scene.add(dir);
+    const fill = new THREE.DirectionalLight(0xfff5e0, 0.3);
+    fill.position.set(cx0 - 300, 400, cz0 - 300);
+    scene.add(fill);
+    scene.add(new THREE.HemisphereLight(0xffffff, 0x9999aa, 0.4));
 
     const furnitureObjects = [];
-    const walls = [];
     const placedBBoxes = [];
-    const FLOOR_TOP = 2;
+    const walls = [];
+    furnitureObjectsRef.current = furnitureObjects;
+    placedBBoxesRef.current = placedBBoxes;
+    wallsRef.current = walls;
 
-    const wallMaterial = new THREE.MeshStandardMaterial({
-      color: 0xcccccc,
-      roughness: 0.9,
-      metalness: 0.0,
-      side: THREE.DoubleSide,
-      polygonOffset: true,
-      polygonOffsetFactor: 1,
-      polygonOffsetUnits: 1,
-      transparent: false,
-      opacity: 1.0,
+    const wallMat = new THREE.MeshStandardMaterial({
+      color: 0xcdd3db, roughness: 0.85, metalness: 0,
+      side: THREE.DoubleSide, polygonOffset: true,
+      polygonOffsetFactor: 1, polygonOffsetUnits: 1,
     });
+    const floorPalette = [0xe4e8f0, 0xeaedf5];
 
-    rooms.forEach((room, roomIndex) => {
-      const roomGroup = new THREE.Group();
-      roomGroup.name = `room-${roomIndex}`;
-      const roomWidth = room.dimensions.breadth;
-      const roomDepth = room.dimensions.length;
-      const wallHeight = 80;
-      const wallThickness = 5;
-      const cx = roomPositions[roomIndex].x;
-      const cz = roomPositions[roomIndex].z;
+    rooms.forEach((room, ri) => {
+      const rw = room.dimensions.breadth, rd = room.dimensions.length;
+      const wallH = 80, wallT = 5;
+      const cx = roomPositions[ri].x, cz = roomPositions[ri].z;
 
-      const roomFloor = new THREE.Mesh(new THREE.BoxGeometry(roomWidth, 2, roomDepth), wallMaterial);
-      roomFloor.position.set(cx, 1, cz);
-      roomFloor.receiveShadow = true;
-      roomGroup.add(roomFloor);
+      // Floor
+      const floor = new THREE.Mesh(
+        new THREE.BoxGeometry(rw, 2, rd),
+        new THREE.MeshStandardMaterial({ color: floorPalette[ri % 2], roughness: 0.9 })
+      );
+      floor.position.set(cx, 1, cz);
+      floor.receiveShadow = true;
+      scene.add(floor);
 
-      const addWall = (geom, pos, normal) => {
-        const wall = new THREE.Mesh(geom, wallMaterial.clone());
-        wall.position.set(...pos);
-        wall.castShadow = true;
-        wall.receiveShadow = true;
-        wall.userData.normal = normal;
-        wall.userData.wallType = 'vertical';
-        walls.push(wall);
-        roomGroup.add(wall);
+      // Subtle grid
+      const grid = new THREE.GridHelper(Math.max(rw, rd), Math.floor(Math.max(rw, rd) / 10), 0xc0c8d4, 0xc0c8d4);
+      grid.position.set(cx, 2.1, cz);
+      grid.material.transparent = true; grid.material.opacity = 0.2;
+      scene.add(grid);
+
+      const addWall = (geo, pos, normal) => {
+        const w = new THREE.Mesh(geo, wallMat.clone());
+        w.position.set(...pos); w.castShadow = true; w.receiveShadow = true;
+        w.userData.normal = normal; w.userData.wallType = 'vertical';
+        walls.push(w); scene.add(w);
       };
+      addWall(new THREE.BoxGeometry(rw, wallH, wallT), [cx, wallH/2, cz - rd/2], new THREE.Vector3(0,0,-1));
+      addWall(new THREE.BoxGeometry(rw, wallH, wallT), [cx, wallH/2, cz + rd/2], new THREE.Vector3(0,0,1));
+      addWall(new THREE.BoxGeometry(wallT, wallH, rd), [cx + rw/2, wallH/2, cz], new THREE.Vector3(1,0,0));
+      if (ri === 0) addWall(new THREE.BoxGeometry(wallT, wallH, rd), [cx - rw/2, wallH/2, cz], new THREE.Vector3(-1,0,0));
 
-      addWall(new THREE.BoxGeometry(roomWidth, wallHeight, wallThickness), [cx, wallHeight / 2, cz - roomDepth / 2], new THREE.Vector3(0, 0, -1));
-      addWall(new THREE.BoxGeometry(roomWidth, wallHeight, wallThickness), [cx, wallHeight / 2, cz + roomDepth / 2], new THREE.Vector3(0, 0, 1));
-      addWall(new THREE.BoxGeometry(wallThickness, wallHeight, roomDepth), [cx + roomWidth / 2, wallHeight / 2, cz], new THREE.Vector3(1, 0, 0));
-      if (roomIndex === 0) {
-        addWall(new THREE.BoxGeometry(wallThickness, wallHeight, roomDepth), [cx - roomWidth / 2, wallHeight / 2, cz], new THREE.Vector3(-1, 0, 0));
-      }
-
-      scene.add(roomGroup);
-
+      // Initial furniture
       const loader = new GLTFLoader();
-      room.furniture.forEach((item, itemIndex) => {
-        const modelData = assets.models.find((m) => m?.name?.toLowerCase() === item?.type?.toLowerCase());
-        let modelPath;
-        if (modelData) {
-          modelPath = modelData.path.replace('@assets', '/src/assets');
-        } else {
-          const itemType = item?.type?.toLowerCase() || '';
-          let bestMatch = null;
-          let bestScore = 0;
-          for (const model of assets.models) {
-            const modelName = model?.name?.toLowerCase() || '';
-            let score = 0;
-            for (let i = 0; i < itemType.length; i++) {
-              for (let j = i + 1; j <= itemType.length; j++) {
-                const substr = itemType.substring(i, j);
-                if (substr.length > 2 && modelName.includes(substr)) score = Math.max(score, substr.length);
-              }
+      room.furniture.forEach((item, ii) => {
+        const md = assets.models.find((m) => m?.name?.toLowerCase() === item?.type?.toLowerCase());
+        let mp = md ? md.path : null;
+        if (!mp) {
+          const it = item?.type?.toLowerCase() || '';
+          let best = null, bs = 0;
+          for (const m of assets.models) {
+            const mn = m?.name?.toLowerCase() || ''; let sc = 0;
+            for (let i = 0; i < it.length; i++) for (let j = i+1; j <= it.length; j++) {
+              const s = it.substring(i, j);
+              if (s.length > 2 && mn.includes(s)) sc = Math.max(sc, s.length);
             }
-            if (score > bestScore) { bestScore = score; bestMatch = model; }
+            if (sc > bs) { bs = sc; best = m; }
           }
-          modelPath = (bestMatch || assets.models[0]).path.replace('@assets', '/src/assets');
+          mp = (best || assets.models[0]).path;
         }
+        mp = mp.replace('@assets', '/src/assets');
 
-        loader.load(modelPath, (gltf) => {
+        loader.load(mp, (gltf) => {
           const model = gltf.scene;
           model.scale.multiplyScalar(25);
           const bbox = new THREE.Box3().setFromObject(model);
           const size = bbox.getSize(new THREE.Vector3());
-          const halfRoomW = roomWidth / 2;
-          const halfRoomD = roomDepth / 2;
-          const margin = 2;
-          const maxX = halfRoomW - wallThickness - size.x / 2 - margin;
-          const minX = -halfRoomW + wallThickness + size.x / 2 + margin;
-          const maxZ = halfRoomD - wallThickness - size.z / 2 - margin;
-          const minZ = -halfRoomD + wallThickness + size.z / 2 + margin;
-
-          let placedX = item.position[0];
-          let placedZ = item.position[1];
-          if (minX <= maxX) placedX = Math.min(Math.max(placedX, minX), maxX); else placedX = 0;
-          if (minZ <= maxZ) placedZ = Math.min(Math.max(placedZ, minZ), maxZ); else placedZ = 0;
-
+          const hw = rw/2, hd = rd/2, m2 = 2;
+          const maxX = hw - wallT - size.x/2 - m2, minX = -hw + wallT + size.x/2 + m2;
+          const maxZ = hd - wallT - size.z/2 - m2, minZ = -hd + wallT + size.z/2 + m2;
+          let px = item.position[0], pz = item.position[1];
+          if (minX <= maxX) px = Math.min(Math.max(px, minX), maxX); else px = 0;
+          if (minZ <= maxZ) pz = Math.min(Math.max(pz, minZ), maxZ); else pz = 0;
           const yPos = FLOOR_TOP - bbox.min.y;
 
-          const testBBoxAt = (xRel, zRel) => {
-            model.position.set(xRel + cx, yPos, zRel + cz);
-            const b = new THREE.Box3().setFromObject(model);
-            return placedBBoxes.some((other) => b.intersectsBox(other.bbox));
-          };
-
-          if (testBBoxAt(placedX, placedZ)) {
-            const step = Math.max(size.x, size.z, 5);
-            let found = false;
-            for (let r = step; r <= Math.max(roomWidth, roomDepth) && !found; r += step) {
+          const testAt = (tx, tz) => { model.position.set(tx+cx, yPos, tz+cz); const b = new THREE.Box3().setFromObject(model); return placedBBoxes.some((o) => b.intersectsBox(o.bbox)); };
+          if (testAt(px, pz)) {
+            const step = Math.max(size.x, size.z, 5); let found = false;
+            for (let r = step; r <= Math.max(rw, rd) && !found; r += step)
               for (let ang = 0; ang < 360; ang += 30) {
-                const rad = (ang * Math.PI) / 180;
-                const nx = placedX + Math.cos(rad) * r;
-                const nz = placedZ + Math.sin(rad) * r;
+                const rad = ang * Math.PI / 180;
+                const nx = px + Math.cos(rad) * r, nz = pz + Math.sin(rad) * r;
                 if (nx < minX || nx > maxX || nz < minZ || nz > maxZ) continue;
-                if (!testBBoxAt(nx, nz)) { placedX = nx; placedZ = nz; found = true; break; }
+                if (!testAt(nx, nz)) { px = nx; pz = nz; found = true; break; }
               }
-            }
-            if (!found) { placedX = 0; placedZ = 0; }
+            if (!found) { px = 0; pz = 0; }
           }
-
-          model.position.set(placedX + cx, yPos, placedZ + cz);
+          model.position.set(px+cx, yPos, pz+cz);
           placedBBoxes.push({ model, bbox: new THREE.Box3().setFromObject(model) });
-
-          model.traverse((child) => {
-            if (child.isMesh) { child.castShadow = true; child.receiveShadow = true; }
-          });
-
-          model.userData = { type: item.type, roomIndex, itemIndex, roomType: room.roomtype, originalPosition: model.position.clone(), isInteractive: true };
+          model.traverse((c) => { if (c.isMesh) { c.castShadow = true; c.receiveShadow = true; } });
+          model.userData = { type: item.type, roomIndex: ri, itemIndex: ii, roomType: room.roomtype, originalPosition: model.position.clone(), isInteractive: true };
           furnitureObjects.push(model);
           scene.add(model);
-        }, undefined, (err) => console.error('Error loading model:', err));
+        }, undefined, (e) => console.error(e));
       });
     });
 
-    furnitureObjectsRef.current = furnitureObjects;
-    wallsRef.current = walls;
-
-    function updateWallVisibility() {
-      walls.forEach((wall) => {
-        if (wall.userData.wallType !== 'vertical') return;
-        const wallWorldPos = new THREE.Vector3();
-        wall.getWorldPosition(wallWorldPos);
-        const toWall = new THREE.Vector3().subVectors(wallWorldPos, camera.position).normalize();
-        const dot = toWall.dot(wall.userData.normal.clone());
-        wall.visible = dot >= -0.1;
-        wall.material.opacity = wall.visible ? 1.0 : 0;
+    // Wall visibility
+    const updateWalls = () => {
+      walls.forEach((w) => {
+        if (w.userData.wallType !== 'vertical') return;
+        const wp = new THREE.Vector3(); w.getWorldPosition(wp);
+        const toW = new THREE.Vector3().subVectors(wp, camera.position).normalize();
+        w.visible = toW.dot(w.userData.normal.clone()) >= -0.1;
       });
-    }
+    };
 
-    const onMouseMove = (event) => {
+    // ── Interaction handlers ────────────────────────────────────────────────
+    const getCanvasNDC = (e) => {
+      const rect = renderer.domElement.getBoundingClientRect();
+      return {
+        x: ((e.clientX - rect.left) / rect.width) * 2 - 1,
+        y: -((e.clientY - rect.top) / rect.height) * 2 + 1,
+      };
+    };
+
+    const findInteractiveParent = (obj) => {
+      while (obj && !obj.userData.isInteractive) obj = obj.parent;
+      return obj;
+    };
+
+    const onMouseMove = (e) => {
       if (isRotatingRef.current && dragSelectedRef.current) {
-        const deltaX = event.clientX - lastMouseYRef.current;
-        lastMouseYRef.current = event.clientX;
-        dragSelectedRef.current.rotation.y += deltaX * 0.01;
+        dragSelectedRef.current.rotation.y += (e.clientX - lastMouseXRef.current) * 0.01;
+        lastMouseXRef.current = e.clientX;
         renderer.domElement.style.cursor = 'crosshair';
         return;
       }
-      const rect = renderer.domElement.getBoundingClientRect();
-      mouseRef.current.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-      mouseRef.current.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      const { x, y } = getCanvasNDC(e);
+      mouseRef.current.set(x, y);
 
       if (isDraggingRef.current && dragSelectedRef.current) {
         raycasterRef.current.setFromCamera(mouseRef.current, camera);
-        const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -FLOOR_TOP);
-        const intersectPoint = new THREE.Vector3();
-        if (raycasterRef.current.ray.intersectPlane(plane, intersectPoint)) {
+        const plane = new THREE.Plane(new THREE.Vector3(0,1,0), -FLOOR_TOP);
+        const hit = new THREE.Vector3();
+        if (raycasterRef.current.ray.intersectPlane(plane, hit)) {
           const model = dragSelectedRef.current;
-          const desiredWorld = intersectPoint.clone().sub(dragOffsetRef.current);
-          const roomIdx = model.userData.roomIndex;
-          const cx = roomPositions[roomIdx].x;
-          const cz = roomPositions[roomIdx].z;
-          const roomWidth = rooms[roomIdx].dimensions.breadth;
-          const roomDepth = rooms[roomIdx].dimensions.length;
-          const bbox = new THREE.Box3().setFromObject(model);
-          const size = bbox.getSize(new THREE.Vector3());
-          const margin = 2;
-          const wallThickness = 5;
-          const maxX = roomWidth / 2 - wallThickness - size.x / 2 - margin;
-          const minX = -roomWidth / 2 + wallThickness + size.x / 2 + margin;
-          const maxZ = roomDepth / 2 - wallThickness - size.z / 2 - margin;
-          const minZ = -roomDepth / 2 + wallThickness + size.z / 2 + margin;
-          let relX = Math.min(Math.max(desiredWorld.x - cx, minX <= maxX ? minX : 0), minX <= maxX ? maxX : 0);
-          let relZ = Math.min(Math.max(desiredWorld.z - cz, minZ <= maxZ ? minZ : 0), minZ <= maxZ ? maxZ : 0);
-          const origPos = model.position.clone();
-          model.position.set(relX + cx, FLOOR_TOP - bbox.min.y, relZ + cz);
+          const desired = hit.clone().sub(dragOffsetRef.current);
+          const ri = model.userData.roomIndex;
+          const rp = roomPositions[ri], rv = rooms[ri];
+          if (!rp || !rv) return;
+          const rw = rv.dimensions.breadth, rd = rv.dimensions.length;
+          const bb = new THREE.Box3().setFromObject(model);
+          const sz = bb.getSize(new THREE.Vector3());
+          const m2 = 2, wt = 5;
+          const maxX = rw/2 - wt - sz.x/2 - m2, minX = -rw/2 + wt + sz.x/2 + m2;
+          const maxZ = rd/2 - wt - sz.z/2 - m2, minZ = -rd/2 + wt + sz.z/2 + m2;
+          let rx = desired.x - rp.x, rz = desired.z - rp.z;
+          if (minX <= maxX) rx = Math.min(Math.max(rx, minX), maxX); else rx = 0;
+          if (minZ <= maxZ) rz = Math.min(Math.max(rz, minZ), maxZ); else rz = 0;
+          const orig = model.position.clone();
+          model.position.set(rx + rp.x, FLOOR_TOP - bb.min.y, rz + rp.z);
           const newBB = new THREE.Box3().setFromObject(model);
-          const collided = placedBBoxes.some((other) => other.model !== model && newBB.intersectsBox(other.bbox));
-          if (!collided) {
-            const entry = placedBBoxes.find((e) => e.model === model);
-            if (entry) entry.bbox.copy(newBB);
-          } else {
-            model.position.copy(origPos);
-          }
+          if (placedBBoxes.some((o) => o.model !== model && newBB.intersectsBox(o.bbox))) model.position.copy(orig);
+          else { const ent = placedBBoxes.find((e2) => e2.model === model); if (ent) ent.bbox.copy(newBB); }
           renderer.domElement.style.cursor = 'grabbing';
-          return;
         }
+        return;
       }
 
       raycasterRef.current.setFromCamera(mouseRef.current, camera);
-      const intersects = raycasterRef.current.intersectObjects(furnitureObjects, true);
-      if (intersects.length > 0) {
-        let object = intersects[0].object;
-        while (object.parent && !object.userData.isInteractive) object = object.parent;
-        if (object.userData.isInteractive) {
-          setHoveredFurniture(object.userData);
-          renderer.domElement.style.cursor = 'pointer';
-          return;
-        }
+      const hits = raycasterRef.current.intersectObjects(furnitureObjects, true);
+      if (hits.length) {
+        const obj = findInteractiveParent(hits[0].object);
+        if (obj?.userData.isInteractive) { setHoveredFurniture(obj.userData); renderer.domElement.style.cursor = 'grab'; return; }
       }
-      setHoveredFurniture(null);
-      renderer.domElement.style.cursor = 'default';
+      setHoveredFurniture(null); renderer.domElement.style.cursor = 'default';
     };
 
-    const onPointerDown = (event) => {
+    const onPointerDown = (e) => {
       if (isRotatingRef.current) return;
-      const rect = renderer.domElement.getBoundingClientRect();
-      mouseRef.current.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-      mouseRef.current.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+      const { x, y } = getCanvasNDC(e);
+      mouseRef.current.set(x, y);
       raycasterRef.current.setFromCamera(mouseRef.current, camera);
-      const intersects = raycasterRef.current.intersectObjects(furnitureObjects, true);
-      if (intersects.length > 0) {
-        let object = intersects[0].object;
-        while (object.parent && !object.userData.isInteractive) object = object.parent;
-        if (object.userData.isInteractive) {
-          dragSelectedRef.current = object;
-          setSelectedFurniture(object.userData);
+      const hits = raycasterRef.current.intersectObjects(furnitureObjects, true);
+      if (hits.length) {
+        const obj = findInteractiveParent(hits[0].object);
+        if (obj?.userData.isInteractive) {
+          dragSelectedRef.current = obj; setSelectedFurniture(obj.userData);
           isDraggingRef.current = true;
-          const plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), -FLOOR_TOP);
-          const intersectPoint = new THREE.Vector3();
-          if (raycasterRef.current.ray.intersectPlane(plane, intersectPoint)) {
-            dragOffsetRef.current.copy(intersectPoint).sub(object.position);
-          } else {
-            dragOffsetRef.current.set(0, 0, 0);
-          }
-          const idx = placedBBoxes.findIndex((e) => e.model === object);
+          const plane = new THREE.Plane(new THREE.Vector3(0,1,0), -FLOOR_TOP);
+          const hit = new THREE.Vector3();
+          if (raycasterRef.current.ray.intersectPlane(plane, hit)) dragOffsetRef.current.copy(hit).sub(obj.position);
+          else dragOffsetRef.current.set(0,0,0);
+          const idx = placedBBoxes.findIndex((e2) => e2.model === obj);
           if (idx >= 0) placedBBoxes.splice(idx, 1);
           controls.enabled = false;
         }
@@ -328,156 +378,161 @@ export default function ThreeDView({ rooms }) {
     };
 
     const onPointerUp = () => {
-      if (isRotatingRef.current) {
-        isRotatingRef.current = false;
-        dragSelectedRef.current = null;
-        controls.enabled = true;
-        renderer.domElement.style.cursor = 'default';
-        return;
-      }
-      if (isDraggingRef.current && dragSelectedRef.current) {
-        placedBBoxes.push({ model: dragSelectedRef.current, bbox: new THREE.Box3().setFromObject(dragSelectedRef.current) });
-      }
-      isDraggingRef.current = false;
-      dragSelectedRef.current = null;
-      controls.enabled = true;
-      renderer.domElement.style.cursor = 'default';
+      if (isRotatingRef.current) { isRotatingRef.current = false; dragSelectedRef.current = null; controls.enabled = true; renderer.domElement.style.cursor = 'default'; return; }
+      if (isDraggingRef.current && dragSelectedRef.current) placedBBoxes.push({ model: dragSelectedRef.current, bbox: new THREE.Box3().setFromObject(dragSelectedRef.current) });
+      isDraggingRef.current = false; dragSelectedRef.current = null; controls.enabled = true; renderer.domElement.style.cursor = 'default';
     };
 
-    const onDoubleClick = (event) => {
-      const rect = renderer.domElement.getBoundingClientRect();
-      mouseRef.current.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-      mouseRef.current.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    const onDblClick = (e) => {
+      const { x, y } = getCanvasNDC(e); mouseRef.current.set(x, y);
       raycasterRef.current.setFromCamera(mouseRef.current, camera);
-      const intersects = raycasterRef.current.intersectObjects(furnitureObjects, true);
-      if (intersects.length > 0) {
-        let object = intersects[0].object;
-        while (object.parent && !object.userData.isInteractive) object = object.parent;
-        if (object.userData.isInteractive) {
-          dragSelectedRef.current = object;
-          isRotatingRef.current = true;
-          lastMouseYRef.current = event.clientX;
-          controls.enabled = false;
-        }
+      const hits = raycasterRef.current.intersectObjects(furnitureObjects, true);
+      if (hits.length) {
+        const obj = findInteractiveParent(hits[0].object);
+        if (obj?.userData.isInteractive) { dragSelectedRef.current = obj; isRotatingRef.current = true; lastMouseXRef.current = e.clientX; controls.enabled = false; }
       }
     };
 
-    const onClick = (event) => {
-      const rect = renderer.domElement.getBoundingClientRect();
-      mouseRef.current.x = ((event.clientX - rect.left) / rect.width) * 2 - 1;
-      mouseRef.current.y = -((event.clientY - rect.top) / rect.height) * 2 + 1;
+    const onClick = (e) => {
+      const { x, y } = getCanvasNDC(e); mouseRef.current.set(x, y);
       raycasterRef.current.setFromCamera(mouseRef.current, camera);
-      const intersects = raycasterRef.current.intersectObjects(furnitureObjects, true);
-      if (intersects.length > 0) {
-        let object = intersects[0].object;
-        while (object.parent && !object.userData.isInteractive) object = object.parent;
-        if (object.userData.isInteractive) { setSelectedFurniture(object.userData); return; }
-      }
+      const hits = raycasterRef.current.intersectObjects(furnitureObjects, true);
+      if (hits.length) { const obj = findInteractiveParent(hits[0].object); if (obj?.userData.isInteractive) { setSelectedFurniture(obj.userData); return; } }
       setSelectedFurniture(null);
     };
 
     renderer.domElement.addEventListener('mousemove', onMouseMove);
     renderer.domElement.addEventListener('pointerdown', onPointerDown);
     renderer.domElement.addEventListener('pointerup', onPointerUp);
+    renderer.domElement.addEventListener('dblclick', onDblClick);
     renderer.domElement.addEventListener('click', onClick);
-    renderer.domElement.addEventListener('dblclick', onDoubleClick);
 
-    // Handle resize
     const onResize = () => {
-      const w = mount.clientWidth;
-      const h = mount.clientHeight;
-      camera.aspect = w / h;
-      camera.updateProjectionMatrix();
-      renderer.setSize(w, h);
+      const w = mount.clientWidth, h = mount.clientHeight;
+      camera.aspect = w / h; camera.updateProjectionMatrix(); renderer.setSize(w, h);
     };
     window.addEventListener('resize', onResize);
 
-    function animate() {
-      requestAnimationFrame(animate);
-      controls.update();
-      updateWallVisibility();
-      renderer.render(scene, camera);
-    }
+    let animId;
+    const animate = () => { animId = requestAnimationFrame(animate); controls.update(); updateWalls(); renderer.render(scene, camera); };
     animate();
 
     return () => {
+      cancelAnimationFrame(animId);
       window.removeEventListener('resize', onResize);
       renderer.domElement.removeEventListener('mousemove', onMouseMove);
       renderer.domElement.removeEventListener('pointerdown', onPointerDown);
       renderer.domElement.removeEventListener('pointerup', onPointerUp);
+      renderer.domElement.removeEventListener('dblclick', onDblClick);
       renderer.domElement.removeEventListener('click', onClick);
-      renderer.domElement.removeEventListener('dblclick', onDoubleClick);
       if (mount.contains(renderer.domElement)) mount.removeChild(renderer.domElement);
       renderer.dispose();
     };
   }, [rooms]);
 
   return (
-    /* FIX: was height:'100vh' which overflowed — now height:'100%' to fill parent */
-    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
-      <div
-        ref={mountRef}
-        style={{ width: '100%', height: '100%', background: '#f5f5f5' }}
-      />
+    <div
+      style={{ position: 'relative', width: '100%', height: '100%' }}
+      onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; setDropHighlight(true); }}
+      onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget)) setDropHighlight(false); }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDropHighlight(false);
+        const modelName = e.dataTransfer.getData('text/plain');
+        if (modelName && ref?.current) ref.current.addFurnitureAtDrop(e.clientX, e.clientY, modelName);
+      }}
+    >
+      <div ref={mountRef} style={{ width: '100%', height: '100%' }} />
+
+      {/* Drop highlight overlay */}
+      {dropHighlight && (
+        <div style={{
+          position: 'absolute', inset: 0, pointerEvents: 'none', zIndex: 20,
+          border: '3px dashed #6366f1', borderRadius: 8,
+          background: 'rgba(99,102,241,0.06)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+        }}>
+          <div style={{
+            background: 'rgba(99,102,241,0.95)', color: 'white',
+            padding: '12px 32px', borderRadius: 16, fontSize: 15, fontWeight: 700,
+            boxShadow: '0 8px 32px rgba(99,102,241,0.35)',
+          }}>
+            📦 Release to place furniture
+          </div>
+        </div>
+      )}
+
+      {/* Adding indicator */}
+      {isAdding && (
+        <div style={{
+          position: 'absolute', top: 16, left: '50%', transform: 'translateX(-50%)',
+          background: 'rgba(17,24,39,0.88)', color: 'white',
+          padding: '8px 20px', borderRadius: 20, fontSize: 13, fontWeight: 600,
+          display: 'flex', alignItems: 'center', gap: 8, zIndex: 30,
+          backdropFilter: 'blur(10px)',
+        }}>
+          <svg style={{ animation: 'spin 0.8s linear infinite', width: 15, height: 15, flexShrink: 0 }} viewBox="0 0 24 24" fill="none">
+            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.25" />
+            <path fill="currentColor" opacity="0.8" d="M4 12a8 8 0 018-8v8H4z" />
+          </svg>
+          Placing {addingName}…
+        </div>
+      )}
 
       {/* Hover tooltip */}
-      {hoveredFurniture && (
+      {hoveredFurniture && !isAdding && (
         <div style={{
-          position: 'absolute', top: 16, left: 16,
-          background: 'rgba(17,24,39,0.9)', color: 'white',
+          position: 'absolute', top: 16, left: 16, pointerEvents: 'none', zIndex: 20,
+          background: 'rgba(17,24,39,0.88)', color: 'white',
           padding: '8px 14px', borderRadius: 10, fontSize: 13,
-          pointerEvents: 'none', backdropFilter: 'blur(8px)',
-          border: '1px solid rgba(255,255,255,0.1)',
+          backdropFilter: 'blur(8px)', border: '1px solid rgba(255,255,255,0.08)',
         }}>
-          <strong>{hoveredFurniture.type}</strong>
-          <div style={{ fontSize: 11, opacity: 0.75, marginTop: 2 }}>{hoveredFurniture.roomType}</div>
+          <strong style={{ display: 'block', fontSize: 13 }}>{hoveredFurniture.type?.replace(/_/g, ' ')}</strong>
+          <span style={{ fontSize: 11, opacity: 0.65 }}>{hoveredFurniture.roomType}</span>
         </div>
       )}
 
       {/* Selection panel */}
       {selectedFurniture && (
         <div style={{
-          position: 'absolute', top: 16, right: 16,
+          position: 'absolute', top: 16, right: 16, zIndex: 20,
           background: 'white', padding: '14px 16px', borderRadius: 14,
-          boxShadow: '0 4px 24px rgba(0,0,0,0.12)', minWidth: 200,
-          border: '1px solid #f0f0f0',
+          boxShadow: '0 4px 24px rgba(0,0,0,0.11)', minWidth: 210,
+          border: '1px solid #e5e7eb',
         }}>
-          <div style={{ fontSize: 15, fontWeight: 700, color: '#111', marginBottom: 4 }}>
-            {selectedFurniture.type}
+          <div style={{ fontSize: 10, color: '#9ca3af', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.07em', marginBottom: 8 }}>Selected Item</div>
+          <div style={{ fontSize: 15, fontWeight: 700, color: '#111', marginBottom: 3 }}>
+            {selectedFurniture.type?.replace(/_/g, ' ')}
           </div>
-          <div style={{ fontSize: 12, color: '#888', marginBottom: 12 }}>
-            📍 {selectedFurniture.roomType}
-          </div>
-          <div style={{ fontSize: 11, color: '#aaa', marginBottom: 10, lineHeight: 1.5 }}>
-            Drag to move • Double-click to rotate
+          <div style={{ fontSize: 12, color: '#6b7280', marginBottom: 12 }}>📍 {selectedFurniture.roomType}</div>
+          <div style={{ fontSize: 11, color: '#6b7280', lineHeight: 1.7, marginBottom: 12, padding: '8px 10px', background: '#f8fafc', borderRadius: 8, border: '1px solid #f1f5f9' }}>
+            🖱 <b>Drag</b> to reposition<br />
+            ↔ <b>Double-click</b> to rotate
           </div>
           <button
             onClick={() => setSelectedFurniture(null)}
-            style={{
-              width: '100%', padding: '6px 10px', fontSize: 12,
-              borderRadius: 8, border: '1px solid #e5e7eb',
-              background: '#f9fafb', color: '#374151',
-              cursor: 'pointer', fontWeight: 600,
-            }}
-          >
-            Deselect
-          </button>
+            style={{ width: '100%', padding: '7px', fontSize: 12, borderRadius: 8, border: '1px solid #e5e7eb', background: '#f9fafb', color: '#374151', cursor: 'pointer', fontWeight: 600 }}
+          >✕ Deselect</button>
         </div>
       )}
 
-      {/* Controls hint */}
+      {/* Bottom hint bar */}
       <div style={{
-        position: 'absolute', bottom: 16, left: '50%', transform: 'translateX(-50%)',
-        background: 'rgba(17,24,39,0.75)', color: 'white',
-        padding: '6px 16px', borderRadius: 20, fontSize: 11,
-        pointerEvents: 'none', backdropFilter: 'blur(8px)',
-        display: 'flex', gap: 16,
+        position: 'absolute', bottom: 14, left: '50%', transform: 'translateX(-50%)',
+        background: 'rgba(17,24,39,0.72)', color: 'rgba(255,255,255,0.82)',
+        padding: '5px 20px', borderRadius: 20, fontSize: 11, pointerEvents: 'none',
+        backdropFilter: 'blur(8px)', display: 'flex', gap: 20, whiteSpace: 'nowrap', zIndex: 15,
       }}>
-        <span>🖱 Drag to orbit</span>
-        <span>⚙ Drag furniture to move</span>
-        <span>↔ Double-click to rotate</span>
-        <span>🔍 Scroll to zoom</span>
+        <span>🌀 Orbit</span>
+        <span>🖱 Move furniture</span>
+        <span>↔ Dbl-click rotate</span>
+        <span>🔍 Scroll zoom</span>
+        <span>📦 Drag from palette</span>
       </div>
+
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
     </div>
   );
-}
+});
+
+export default ThreeDView;
