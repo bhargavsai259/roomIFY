@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+from dotenv import load_dotenv
 from fastapi import FastAPI, UploadFile, File, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +10,9 @@ import io
 import replicate
 from ultralytics import YOLO
 from transformers import CLIPProcessor, CLIPModel
+
+# Load environment variables from .env file
+load_dotenv()
 
 try:
     from groq import Groq
