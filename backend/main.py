@@ -199,16 +199,62 @@ async def replicate_api(request: Request):
         token = os.getenv("REPLICATE_API_TOKEN", "")
         if not token:
             return JSONResponse(content={"error":"REPLICATE_API_TOKEN missing"}, status_code=500)
+        
+        image_data = req.get("image")
+        theme = req.get("theme", "modern")
+        room_type = req.get("room", "living room")
+        
+        # Check if room is empty
+        is_empty = req.get("is_empty", False)
+        
+        # Define furniture prompts for different room types
+        room_furniture_map = {
+            "living room": "sofa, coffee table, TV unit, decorative plants, lamps, side tables",
+            "bedroom": "bed, nightstands, wardrobe, dresser, lamps, decorative items",
+            "kitchen": "cabinets, countertops, appliances, dining table, chairs",
+            "bathroom": "bathtub, sink, mirror, toilet, storage cabinets",
+            "office": "desk, office chair, bookshelf, computer, storage units",
+            "dining room": "dining table, chairs, sideboard, chandelier, decorative pieces"
+        }
+        
+        # Normalize room type for lookup
+        room_key = room_type.lower().replace("_", " ")
+        furniture_suggestions = room_furniture_map.get(room_key, "appropriate furniture and decor")
+        
+        # Enhanced prompt for empty rooms
+        if is_empty:
+            main_prompt = f"A fully furnished {theme} style {room_type} with {furniture_suggestions}, Editorial Style Photo, 4k, well-decorated interior"
+            additional_prompt = "best quality, extremely detailed, interior, cinematic photo, complete room setup, fully furnished, cozy atmosphere, professional interior design"
+        else:
+            main_prompt = f"A {theme} style {room_type} Editorial Style Photo, 4k"
+            additional_prompt = "best quality, extremely detailed, interior, cinematic photo"
+        
         client = replicate.Client(api_token=token)
         output = client.run(
             "jagilley/controlnet-hough:854e8727697a057c525cdb45ab037f64ecca770a1769cc52287c2e56472a247b",
-            input={"image":req.get("image"),
-                   "prompt":f"A {req.get('theme')} {req.get('room')} Editorial Style Photo, 4k",
-                   "a_prompt":"best quality, extremely detailed, interior, cinematic photo"},
+            input={
+                "image": image_data,
+                "prompt": main_prompt,
+                "a_prompt": additional_prompt,
+                "num_samples": "1",
+                "image_resolution": "512",
+                "strength": 1.0,
+                "guidance_scale": 9.0
+            },
         )
-        return JSONResponse(content={"output":[str(i) for i in output] if isinstance(output,list) else []}, status_code=201)
+        
+        return JSONResponse(
+            content={
+                "output": [str(i) for i in output] if isinstance(output, list) else [],
+                "was_enhanced": is_empty,
+                "applied_theme": theme,
+                "room_type": room_type,
+                "furniture_added": is_empty
+            }, 
+            status_code=201
+        )
     except Exception as e:
-        return JSONResponse(content={"error":str(e)}, status_code=500)
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
 yolo_model     = YOLO('yolov8n.pt')
